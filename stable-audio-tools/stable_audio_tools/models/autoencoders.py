@@ -37,35 +37,43 @@ def get_activation(activation: Literal["elu", "snake", "none"], antialias=False,
     return act
 
 class ResidualUnit(nn.Module):
-    def __init__(self, in_channels, out_channels, dilation, use_snake=False, antialias_activation=False):
+    def __init__(
+            self,
+            in_channels,
+            out_channels, 
+            dilation,
+            use_snake=False,
+            antialias_activation=False):
         super().__init__()
         
         self.dilation = dilation
 
         padding = (dilation * (7-1)) // 2
-
+        # replace WNConv1d w/ nn.Conv1d
         self.layers = nn.Sequential(
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=out_channels),
-            WNConv1d(in_channels=in_channels, out_channels=out_channels,
+            nn.Conv1d(in_channels=in_channels, out_channels=out_channels,
                       kernel_size=7, dilation=dilation, padding=padding),
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=out_channels),
-            WNConv1d(in_channels=out_channels, out_channels=out_channels,
+            nn.Conv1d(in_channels=out_channels, out_channels=out_channels,
                       kernel_size=1)
         )
 
     def forward(self, x):
-        res = x
-        
-        #x = checkpoint(self.layers, x)
-        x = self.layers(x)
-
-        return x + res
+        return x + self.layers(x)
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        stride,
+        use_snake=False,
+        antialias_activation=False):
         super().__init__()
 
         self.layers = nn.Sequential(
+            # starts with activation, ends with conv.
             ResidualUnit(in_channels=in_channels,
                          out_channels=in_channels, dilation=1, use_snake=use_snake),
             ResidualUnit(in_channels=in_channels,
@@ -73,7 +81,7 @@ class EncoderBlock(nn.Module):
             ResidualUnit(in_channels=in_channels,
                          out_channels=in_channels, dilation=9, use_snake=use_snake),
             get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=in_channels),
-            WNConv1d(in_channels=in_channels, out_channels=out_channels,
+            nn.Conv1d(in_channels=in_channels, out_channels=out_channels,
                       kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2)),
         )
 
@@ -95,7 +103,7 @@ class DecoderBlock(nn.Module):
                         padding='same')
             )
         else:
-            upsample_layer = WNConvTranspose1d(in_channels=in_channels,
+            upsample_layer = nn.ConvTranspose1d(in_channels=in_channels,
                                out_channels=out_channels,
                                kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2))
 

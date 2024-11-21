@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn, einsum
 from torch.cuda.amp import autocast
 from typing import Callable, Literal
-
+import math
 try:
     from flash_attn import flash_attn_func, flash_attn_kvpacked_func
 except ImportError as e:
@@ -207,7 +207,7 @@ class GLU(nn.Module):
         self.proj = nn.Linear(dim_in, dim_out * 2) if not use_conv else nn.Conv1d(dim_in, dim_out * 2, conv_kernel_size, padding = (conv_kernel_size // 2))
         self.use_conv = use_conv
 
-    def forward(self, x):
+    def forward(self, x): # d is chn
         if self.use_conv:
             x = rearrange(x, 'b n d -> b d n')
             x = self.proj(x)
@@ -267,6 +267,10 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.ff(x)
+
+
+'''
+
 
 class Attention(nn.Module):
     def __init__(
@@ -499,6 +503,234 @@ class Attention(nn.Module):
         elif self.use_pt_flash:
             out = self.flash_attn(q, k, v, causal = causal, mask = final_attn_mask)
 
+        else:
+            # Fall back to custom implementation
+
+            if h != kv_h:
+                # Repeat interleave kv_heads to match q_heads
+                heads_per_kv_head = h // kv_h
+                k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
+
+            scale = 1. / (q.shape[-1] ** 0.5)
+
+            kv_einsum_eq = 'b j d' if k.ndim == 3 else 'b h j d'
+
+            dots = einsum(f'b h i d, {kv_einsum_eq} -> b h i j', q, k) * scale
+            
+            i, j, dtype = *dots.shape[-2:], dots.dtype
+
+            mask_value = -torch.finfo(dots.dtype).max
+
+            if final_attn_mask is not None:
+                dots = dots.masked_fill(~final_attn_mask, mask_value)
+
+            if causal:
+                causal_mask = self.create_causal_mask(i, j, device = device)
+                dots = dots.masked_fill(causal_mask, mask_value)
+
+            attn = F.softmax(dots, dim=-1, dtype=torch.float32)
+            attn = attn.type(dtype)
+
+            out = einsum(f'b h i j, {kv_einsum_eq} -> b h i d', attn, v)
+
+        # merge heads
+        out = rearrange(out, ' b h n d -> b n (h d)')
+
+        # Communicate between heads
+        
+        # with autocast(enabled = False):
+        #     out_dtype = out.dtype
+        #     out = out.to(torch.float32)
+        #     out = self.to_out(out).to(out_dtype)
+        out = self.to_out(out)
+
+        if mask is not None:
+            mask = rearrange(mask, 'b n -> b n 1')
+            out = out.masked_fill(~mask, 0.)
+
+        return out
+'''
+# Custom MHA-Diff-Attn
+
+
+class Attention(nn.Module):
+    '''
+        Revised as a Differential Transformer (w/ MHA support)
+        Original Attention is commented above.
+    '''
+    def __init__(
+        self,
+        dim,
+        dim_heads = 64,
+        dim_context = None,
+        causal = False,
+        zero_init_output=True,
+        qk_norm: Literal['l2', 'ln', 'none'] = 'none',
+        natten_kernel_size = None
+    ):
+        super().__init__()
+        self.dim = dim
+        self.dim_heads = dim_heads
+        self.causal = causal
+
+        dim_kv = dim_context if dim_context is not None else dim
+        
+        self.num_heads = dim // dim_heads 
+        self.kv_heads = dim_kv // dim_heads 
+
+        if dim_context is not None:
+            self.to_q = nn.Linear(dim, dim, bias=False)
+            self.to_kv = nn.Linear(dim_kv, dim_kv * 2, bias=False)
+        else:
+            self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+
+        self.to_out = nn.Linear(dim, dim, bias=False)
+
+        if zero_init_output:
+            nn.init.zeros_(self.to_out.weight)
+
+        self.qk_norm = qk_norm
+
+        if self.qk_norm == "ln":
+            self.q_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
+            self.k_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
+
+        # Using 1d neighborhood attention
+        self.natten_kernel_size = natten_kernel_size
+        if natten_kernel_size is not None:
+            return
+
+        self.use_pt_flash = torch.cuda.is_available() and version.parse(torch.__version__) >= version.parse('2.0.0')
+
+        self.use_fa_flash = torch.cuda.is_available() and flash_attn_func is not None
+
+        self.sdp_kwargs = dict(
+            enable_flash = True,
+            enable_math = True,
+            enable_mem_efficient = True
+        )
+        self.reset_lambda(1)
+
+
+    def reset_lambda(self,depth):
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+
+    def lmd(self,q):
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        return lambda_full
+    
+    def forward(
+        self,
+        x,
+        context = None,
+        mask = None,
+        context_mask = None,
+        rotary_pos_emb = None,
+        causal = None
+    ):
+        b, seq_len, embed_dim = x.shape # custom
+
+        h, kv_h, has_context = self.num_heads, self.kv_heads, context is not None
+
+        kv_input = context if has_context else x
+
+        if hasattr(self, 'to_q'):
+            # Use separate linear projections for q and k/v
+            q = self.to_q(x)
+            q = rearrange(q, 'b n (h s d) -> b h n s d', h = 2*h,)
+
+            k, v = self.to_kv(kv_input).chunk(2, dim=-1)
+
+            k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = kv_h), (k, v))
+        else:
+            # Use fused linear projection
+            q, k, v = self.to_qkv(x).chunk(3, dim=-1)
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+        
+        # Normalize q and k for cosine sim attention
+        if self.qk_norm == "l2":
+            q = F.normalize(q, dim=-1)
+            k = F.normalize(k, dim=-1)
+        elif self.qk_norm == "ln":
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        if rotary_pos_emb is not None and not has_context:
+            freqs, _ = rotary_pos_emb
+
+            q_dtype = q.dtype
+            k_dtype = k.dtype
+
+            q = q.to(torch.float32)
+            k = k.to(torch.float32)
+            freqs = freqs.to(torch.float32)
+
+            q = apply_rotary_pos_emb(q, freqs)
+            k = apply_rotary_pos_emb(k, freqs)
+
+            q = q.to(q_dtype)
+            k = k.to(k_dtype)
+        
+        input_mask = context_mask 
+
+        if input_mask is None and not has_context:
+            input_mask = mask
+
+        # determine masking
+        masks = []
+        final_attn_mask = None # The mask that will be applied to the attention matrix, taking all masks into account
+
+        if input_mask is not None:
+            input_mask = rearrange(input_mask, 'b j -> b 1 1 j')
+            masks.append(~input_mask)
+
+        # Other masks will be added here later
+
+        if len(masks) > 0:
+            final_attn_mask = ~or_reduce(masks)
+
+        n, device = q.shape[-2], q.device
+
+        causal = self.causal if causal is None else causal
+
+        if n == 1 and causal:
+            causal = False
+
+
+        if self.use_fa_flash:
+            assert final_attn_mask is None, 'masking not yet supported for Flash Attention 2'
+            # Flash Attention 2 requires FP16 inputs
+            fa_dtype_in = q.dtype
+            b,h,n,d = q.shape
+
+            # turn b n h d -> b n h 2 d//2
+            q, k, v = map(lambda t: rearrange(t, 'b h n d -> b n h a c', a=2,c=d//2).to(torch.float16), (q, k, v))
+            
+            # split 
+            q1, q2 = q[:, :, :, 0], q[:, :, :, 1] 
+            k1, k2 = k[:, :, :, 0], k[:, :, :, 1]
+            v1, v2 = v[:, :, :, 0], v[:, :, :, 1]
+            
+            # First attention pair
+            attn11 = flash_attn_func(q1, k1, v1, causal=True)
+            attn12 = flash_attn_func(q1, k1, v2, causal=True)
+            attn1 = torch.cat([attn11, attn12], dim=-1)
+            
+            # Second attention pair
+            attn21 = flash_attn_func(q2, k2, v1, causal=True)
+            attn22 = flash_attn_func(q2, k2, v2, causal=True)
+            attn2 = torch.cat([attn21, attn22], dim=-1)
+
+            attn = self.ln(attn1 - self.lmd(q) * attn2) * (1 - self.lambda_init)
+            # out = flash_attn_func(q, k, v, causal = causal)
+            
+            out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
         else:
             # Fall back to custom implementation
 

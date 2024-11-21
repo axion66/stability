@@ -51,9 +51,9 @@ class TanhBottleneck(Bottleneck):
 def vae_sample(mean, scale):
         stdev = nn.functional.softplus(scale) + 1e-4
         var = stdev * stdev
-        logvar = torch.log(var)
-        latents = torch.randn_like(mean) * stdev + mean
-
+        logvar = torch.log(var) #
+        latents = torch.randn_like(mean) * stdev + mean # gaussian PDF
+        # var = P(x), entropy =  -logvar, entropy of latents[0,1] = -1
         kl = (mean * mean + var - logvar - 1).sum(1).mean()
 
         return latents, kl
